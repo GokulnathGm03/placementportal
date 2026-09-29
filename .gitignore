@@ -1,0 +1,33 @@
+# Python & Virtual Environments
+venv/
+ENV/
+env/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Node.js & React
+node_modules/
+dist/
+build/
+.npm
+*.log
+
+# IDE & Editor Configs
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# Databases & OS Files
+*.sqlite3
+.DS_Store
+Thumbs.db
