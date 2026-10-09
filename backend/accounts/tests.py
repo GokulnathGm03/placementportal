@@ -3,6 +3,8 @@ from decimal import Decimal
 from django.contrib.auth.models import AnonymousUser, Group, User
 from django.db import migrations
 from django.test import TestCase
+from rest_framework import status
+from rest_framework.test import APITestCase
 from accounts.services import (
     PLACEMENT_INCHARGE_GROUP_NAME,
     ROLE_ANONYMOUS,
@@ -139,3 +141,239 @@ class PlacementInchargeRoleTests(TestCase):
 
         self.assertTrue(is_placement_incharge(dual_user))
         self.assertEqual(get_user_role(dual_user), ROLE_PLACEMENT_INCHARGE)
+
+
+class LoginAPITests(APITestCase):
+    def setUp(self):
+        self.incharge_group = Group.objects.get(name=PLACEMENT_INCHARGE_GROUP_NAME)
+        self.password = "StrongPassword123!"
+
+        # Create student user
+        self.student_user = User.objects.create_user(
+            username='student_user',
+            email='student@example.com',
+            password=self.password
+        )
+        self.student_profile = StudentProfile.objects.create(
+            user=self.student_user,
+            full_name="Jane Doe",
+            registration_number="REG12345",
+            college_code="ENG01",
+            roll_number="21CS001",
+            department="Computer Science",
+            batch="2021-2025",
+            cgpa=Decimal("8.50"),
+            history_of_arrears=0,
+            standing_arrears=0,
+            verification_status="PENDING"
+        )
+
+        # Create Placement Incharge user
+        self.incharge_user = User.objects.create_user(
+            username='incharge_user',
+            email='incharge@college.edu',
+            password=self.password
+        )
+        self.incharge_user.groups.add(self.incharge_group)
+
+        # Create Superuser
+        self.admin_user = User.objects.create_superuser(
+            username='admin_user',
+            email='admin@college.edu',
+            password=self.password
+        )
+
+        # Create Staff user (no incharge group)
+        self.staff_user = User.objects.create_user(
+            username='staff_user',
+            email='staff@college.edu',
+            password=self.password,
+            is_staff=True
+        )
+
+        # Create Ordinary user
+        self.ordinary_user = User.objects.create_user(
+            username='ordinary_user',
+            email='ordinary@example.com',
+            password=self.password
+        )
+
+    def test_student_login_success(self):
+        """Student login returns 200, JWT tokens, STUDENT role, and safe profile summary."""
+        response = self.client.post('/api/auth/login/', {
+            'email': 'student@example.com',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access', response.data)
+        self.assertIn('refresh', response.data)
+        self.assertIn('user', response.data)
+
+        user_data = response.data['user']
+        self.assertEqual(user_data['id'], self.student_user.id)
+        self.assertEqual(user_data['email'], 'student@example.com')
+        self.assertEqual(user_data['role'], 'STUDENT')
+
+        profile_data = user_data['student_profile']
+        self.assertIsNotNone(profile_data)
+        self.assertEqual(profile_data['registration_number'], 'REG12345')
+        self.assertEqual(profile_data['full_name'], 'Jane Doe')
+        self.assertEqual(profile_data['college_code'], 'ENG01')
+        self.assertEqual(profile_data['verification_status'], 'PENDING')
+
+        # Ensure sensitive fields are not exposed
+        self.assertNotIn('password', response.data)
+        self.assertNotIn('password', user_data)
+
+    def test_real_integration_bearer_token_calls_students_me(self):
+        """Real integration test: log in, take access token, call GET /api/students/me/ with Bearer header."""
+        login_response = self.client.post('/api/auth/login/', {
+            'email': 'student@example.com',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(login_response.status_code, status.HTTP_200_OK)
+        access_token = login_response.data['access']
+
+        # Set Bearer token and call protected student profile endpoint
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+        profile_response = self.client.get('/api/students/me/')
+        self.assertEqual(profile_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(profile_response.data['registration_number'], 'REG12345')
+        self.assertEqual(profile_response.data['full_name'], 'Jane Doe')
+
+    def test_placement_incharge_login_success(self):
+        """Placement incharge login returns 200, tokens, PLACEMENT_INCHARGE role, and student_profile=None."""
+        response = self.client.post('/api/auth/login/', {
+            'email': 'incharge@college.edu',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access', response.data)
+        self.assertIn('refresh', response.data)
+        self.assertEqual(response.data['user']['role'], 'PLACEMENT_INCHARGE')
+        self.assertIsNone(response.data['user']['student_profile'])
+
+    def test_superuser_login_success(self):
+        """Superuser login returns 200, tokens, PLACEMENT_INCHARGE role, and student_profile=None."""
+        response = self.client.post('/api/auth/login/', {
+            'email': 'admin@college.edu',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['user']['role'], 'PLACEMENT_INCHARGE')
+        self.assertIsNone(response.data['user']['student_profile'])
+
+    def test_staff_without_group_login_success(self):
+        """Staff user without incharge group receives STAFF role, never PLACEMENT_INCHARGE."""
+        response = self.client.post('/api/auth/login/', {
+            'email': 'staff@college.edu',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['user']['role'], 'STAFF')
+        self.assertNotEqual(response.data['user']['role'], 'PLACEMENT_INCHARGE')
+        self.assertIsNone(response.data['user']['student_profile'])
+
+    def test_ordinary_user_login_success(self):
+        """Ordinary user receives USER role and student_profile=None."""
+        response = self.client.post('/api/auth/login/', {
+            'email': 'ordinary@example.com',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['user']['role'], 'USER')
+        self.assertIsNone(response.data['user']['student_profile'])
+
+    def test_email_normalization_login(self):
+        """Email with leading/trailing spaces and mixed casing authenticates properly."""
+        response = self.client.post('/api/auth/login/', {
+            'email': '  STUDENT@EXAMPLE.COM  ',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['user']['email'], 'student@example.com')
+
+    def test_invalid_password_returns_401(self):
+        """Correct email but wrong password returns 401 with generic error."""
+        response = self.client.post('/api/auth/login/', {
+            'email': 'student@example.com',
+            'password': 'WrongPassword123!',
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(
+            response.data['detail'],
+            "No active account found with the given credentials"
+        )
+
+    def test_nonexistent_email_returns_401(self):
+        """Nonexistent email returns 401 with identical generic error."""
+        response = self.client.post('/api/auth/login/', {
+            'email': 'nobody@example.com',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(
+            response.data['detail'],
+            "No active account found with the given credentials"
+        )
+
+    def test_inactive_user_returns_401(self):
+        """Inactive user account explicitly returns 401 without issuing tokens."""
+        self.student_user.is_active = False
+        self.student_user.save()
+
+        response = self.client.post('/api/auth/login/', {
+            'email': 'student@example.com',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.data['detail'], "User account is disabled.")
+
+    def test_duplicate_email_rejected_with_401(self):
+        """Multiple users sharing identical email returns 401; neither receives tokens."""
+        User.objects.create_user(
+            username='dup_user_1',
+            email='duplicate@example.com',
+            password=self.password
+        )
+        User.objects.create_user(
+            username='dup_user_2',
+            email='duplicate@example.com',
+            password=self.password
+        )
+
+        response = self.client.post('/api/auth/login/', {
+            'email': 'duplicate@example.com',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(
+            response.data['detail'],
+            "No active account found with the given credentials"
+        )
+
+    def test_missing_email_returns_400(self):
+        """Missing email returns 400 Bad Request."""
+        response = self.client.post('/api/auth/login/', {
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('email', response.data)
+
+    def test_missing_password_returns_400(self):
+        """Missing password returns 400 Bad Request."""
+        response = self.client.post('/api/auth/login/', {
+            'email': 'student@example.com',
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('password', response.data)
+
+    def test_login_succeeds_even_with_stale_bearer_token(self):
+        """Stale or invalid Bearer token in header does not block public login."""
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer stale_invalid_token_12345')
+        response = self.client.post('/api/auth/login/', {
+            'email': 'student@example.com',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access', response.data)
