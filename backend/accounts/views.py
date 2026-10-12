@@ -2,6 +2,7 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.views import TokenBlacklistView
 
 from accounts.serializers import LoginSerializer
 
@@ -17,3 +18,16 @@ class LoginView(APIView):
         serializer = LoginSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         return Response(serializer.validated_data, status=status.HTTP_200_OK)
+
+
+class LogoutView(TokenBlacklistView):
+    """
+    Takes a refresh token and blacklists it so it cannot be used again.
+    Inherits public access (authentication_classes = ()) from TokenViewBase
+    so stale or expired access tokens never prevent a user from logging out.
+    """
+    def post(self, request, *args, **kwargs):
+        response = super().post(request, *args, **kwargs)
+        if response.status_code == status.HTTP_200_OK:
+            response.data = {"detail": "Successfully logged out."}
+        return response

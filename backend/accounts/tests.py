@@ -377,3 +377,166 @@ class LoginAPITests(APITestCase):
         }, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn('access', response.data)
+
+
+class TokenRefreshAndLogoutAPITests(APITestCase):
+    def setUp(self):
+        self.password = "StrongPassword123!"
+        self.user = User.objects.create_user(
+            username='refresh_user',
+            email='refresh@example.com',
+            password=self.password
+        )
+        self.profile = StudentProfile.objects.create(
+            user=self.user,
+            full_name="Refresh Tester",
+            registration_number="REG55555",
+            college_code="ENG01",
+            roll_number="21CS055",
+            department="Computer Science",
+            batch="2021-2025",
+            verification_status="PENDING"
+        )
+        # Login to obtain initial tokens
+        login_response = self.client.post('/api/auth/login/', {
+            'email': 'refresh@example.com',
+            'password': self.password,
+        }, format='json')
+        self.assertEqual(login_response.status_code, status.HTTP_200_OK)
+        self.initial_access = login_response.data['access']
+        self.initial_refresh = login_response.data['refresh']
+
+    def test_token_refresh_success(self):
+        """Valid refresh token returns 200, a new access token, and a new rotated refresh token."""
+        response = self.client.post('/api/auth/token/refresh/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access', response.data)
+        self.assertIn('refresh', response.data)
+        self.assertNotEqual(response.data['refresh'], self.initial_refresh)
+
+    def test_token_rotation_blacklists_previous_refresh_token(self):
+        """After rotation, submitting the previous refresh token is rejected as blacklisted."""
+        refresh_response = self.client.post('/api/auth/token/refresh/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(refresh_response.status_code, status.HTTP_200_OK)
+
+        # Attempt to use the original (now previous) refresh token again
+        reuse_response = self.client.post('/api/auth/token/refresh/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(reuse_response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(reuse_response.data['detail'], 'Token is blacklisted')
+
+    def test_newly_rotated_refresh_token_can_be_used(self):
+        """The newly rotated refresh token can be used in subsequent refresh calls."""
+        first_refresh = self.client.post('/api/auth/token/refresh/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(first_refresh.status_code, status.HTTP_200_OK)
+        second_refresh_token = first_refresh.data['refresh']
+
+        second_refresh = self.client.post('/api/auth/token/refresh/', {
+            'refresh': second_refresh_token,
+        }, format='json')
+        self.assertEqual(second_refresh.status_code, status.HTTP_200_OK)
+        self.assertIn('access', second_refresh.data)
+        self.assertIn('refresh', second_refresh.data)
+        self.assertNotEqual(second_refresh.data['refresh'], second_refresh_token)
+
+    def test_refreshed_access_token_authenticates_protected_view(self):
+        """A newly issued access token from refresh successfully authenticates against /api/students/me/."""
+        refresh_response = self.client.post('/api/auth/token/refresh/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(refresh_response.status_code, status.HTTP_200_OK)
+        new_access_token = refresh_response.data['access']
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {new_access_token}')
+        profile_response = self.client.get('/api/students/me/')
+        self.assertEqual(profile_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(profile_response.data['registration_number'], 'REG55555')
+        self.assertEqual(profile_response.data['full_name'], 'Refresh Tester')
+
+    def test_refresh_rejects_invalid_token(self):
+        """Invalid refresh token returns 401 Unauthorized."""
+        response = self.client.post('/api/auth/token/refresh/', {
+            'refresh': 'invalid_garbage_token_value',
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.data['code'], 'token_not_valid')
+
+    def test_refresh_missing_field_returns_400(self):
+        """Omitting 'refresh' field returns 400 Bad Request."""
+        response = self.client.post('/api/auth/token/refresh/', {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('refresh', response.data)
+
+    def test_refresh_succeeds_even_with_stale_bearer_header(self):
+        """Stale or invalid Bearer token in header does not block token refresh."""
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer stale_or_expired_bearer_token')
+        response = self.client.post('/api/auth/token/refresh/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access', response.data)
+        self.assertIn('refresh', response.data)
+
+    def test_logout_success(self):
+        """Valid refresh token blacklists token and returns 200 with confirmation detail."""
+        response = self.client.post('/api/auth/logout/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {'detail': 'Successfully logged out.'})
+
+    def test_blacklisted_token_cannot_be_used_for_refresh(self):
+        """After logout, the blacklisted refresh token cannot be used to refresh tokens."""
+        logout_response = self.client.post('/api/auth/logout/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(logout_response.status_code, status.HTTP_200_OK)
+
+        refresh_response = self.client.post('/api/auth/token/refresh/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(refresh_response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(refresh_response.data['detail'], 'Token is blacklisted')
+
+    def test_repeated_logout_fails(self):
+        """Submitting an already-blacklisted refresh token to logout returns 401."""
+        first_logout = self.client.post('/api/auth/logout/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(first_logout.status_code, status.HTTP_200_OK)
+
+        second_logout = self.client.post('/api/auth/logout/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(second_logout.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(second_logout.data['detail'], 'Token is blacklisted')
+
+    def test_logout_rejects_invalid_token(self):
+        """Invalid refresh token to logout returns 401 Unauthorized."""
+        response = self.client.post('/api/auth/logout/', {
+            'refresh': 'invalid_garbage_token_value',
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.data['code'], 'token_not_valid')
+
+    def test_logout_missing_field_returns_400(self):
+        """Omitting 'refresh' field to logout returns 400 Bad Request."""
+        response = self.client.post('/api/auth/logout/', {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('refresh', response.data)
+
+    def test_logout_succeeds_even_with_stale_bearer_header(self):
+        """Stale or invalid Bearer token in header does not block logout."""
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer stale_or_expired_bearer_token')
+        response = self.client.post('/api/auth/logout/', {
+            'refresh': self.initial_refresh,
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {'detail': 'Successfully logged out.'})
